@@ -45,6 +45,7 @@ from __future__ import absolute_import, division, print_function
 from .utils import multi_tau_lags
 from .roi import extract_label_indices
 from collections import namedtuple
+from dask import delayed
 import numpy as np
 
 import logging
@@ -105,12 +106,12 @@ def _one_time_process(buf, G, past_intensity_norm, future_intensity_norm,
     i_min = num_bufs // 2 if level else 0
     for i in range(i_min, min(img_per_level[level], num_bufs)):
         # compute the index into the autocorrelation matrix
-        t_index = level * num_bufs / 2 + i
+        t_index = int(level * num_bufs / 2 + i)
         delay_no = (buf_no - i) % num_bufs
 
         # get the images for correlating
-        past_img = buf[level, delay_no]
-        future_img = buf[level, buf_no]
+        past_img = buf[level][delay_no]
+        future_img = buf[level][buf_no]
 
         # find the normalization that can work both for bad_images
         #  and good_images
@@ -119,14 +120,15 @@ def _one_time_process(buf, G, past_intensity_norm, future_intensity_norm,
 
         # take out the past_ing and future_img created using bad images
         # (bad images are converted to np.nan array)
-        if np.isnan(past_img).any() or np.isnan(future_img).any():
-            norm[level + 1][ind] += 1
-        else:
-            for w, arr in zip([past_img*future_img, past_img, future_img],
-                              [G, past_intensity_norm, future_intensity_norm]):
-                binned = np.bincount(label_array, weights=w)[1:]
-                arr[t_index] += ((binned / num_pixels -
-                                  arr[t_index]) / normalize)
+        #if np.isnan(past_img).any() or np.isnan(future_img).any():
+        #    norm[level + 1][ind] += 1
+        #else:
+        # TODO Bring back nan-checking.
+        for w, arr in zip([past_img*future_img, past_img, future_img],
+                            [G, past_intensity_norm, future_intensity_norm]):
+            binned = delayed(np.bincount)(label_array, weights=w)[1:]
+            arr[t_index] = arr[t_index] + ((binned / num_pixels -
+                                            arr[t_index]) / normalize)
     return None  # modifies arguments in place!
 
 
@@ -198,9 +200,10 @@ def _init_state_one_time(num_levels, num_bufs, labels):
     G = np.zeros(((num_levels + 1) * num_bufs / 2, num_rois),
                  dtype=np.float64)
     # matrix for normalizing G into g2
-    past_intensity = np.zeros_like(G)
+    past_intensity = np.zeros_like(G).tolist()
     # matrix for normalizing G into g2
-    future_intensity = np.zeros_like(G)
+    future_intensity = np.zeros_like(G).tolist()
+    G = G.tolist()
 
     return _internal_state(
         buf,
@@ -298,7 +301,7 @@ def lazy_one_time(image_iterable, num_levels, num_bufs, labels,
         s.cur[0] = (1 + s.cur[0]) % num_bufs
 
         # Put the ROI pixels into the ring buffer.
-        s.buf[0, s.cur[0] - 1] = np.ravel(image)[s.pixel_list]
+        s.buf[0][s.cur[0] - 1] = delayed(np.ravel)(image)[s.pixel_list]
         buf_no = s.cur[0] - 1
         # Compute the correlations between the first level
         # (undownsampled) frames. This modifies G,
@@ -322,9 +325,9 @@ def lazy_one_time(image_iterable, num_levels, num_bufs, labels,
                 s.cur[level] = (
                     1 + s.cur[level] % num_bufs)
 
-                s.buf[level, s.cur[level] - 1] = ((
-                        s.buf[level - 1, prev - 1] +
-                        s.buf[level - 1, s.cur[level - 1] - 1]) / 2)
+                s.buf[level][s.cur[level] - 1] = ((
+                        s.buf[level - 1][prev - 1] +
+                        s.buf[level - 1][s.cur[level - 1] - 1]) / 2)
 
                 # make the track_level zero once that level is processed
                 s.track_level[level] = False
@@ -342,17 +345,7 @@ def lazy_one_time(image_iterable, num_levels, num_bufs, labels,
                 # Checking whether there is next level for processing
                 processing = level < num_levels
 
-        # If any past intensities are zero, then g2 cannot be normalized at
-        # those levels. This if/else code block is basically preventing
-        # divide-by-zero errors.
-        if len(np.where(s.past_intensity == 0)[0]) != 0:
-            g_max = np.where(s.past_intensity == 0)[0][0]
-        else:
-            g_max = s.past_intensity.shape[0]
-
-        g2 = (s.G[:g_max] / (s.past_intensity[:g_max] *
-                             s.future_intensity[:g_max]))
-        yield results(g2, s.lag_steps[:g_max], s)
+        yield results(s.G, s.lag_steps, s)
 
 
 def multi_tau_auto_corr(num_levels, num_bufs, labels, images):
@@ -532,7 +525,7 @@ def lazy_two_time(labels, images, num_frames, num_bufs, num_levels=1,
         s = s._replace(current_img_time=(s.current_img_time + 1))
 
         # Put the image into the ring buffer.
-        s.buf[0, s.cur[0] - 1] = (np.ravel(img))[s.pixel_list]
+        s.buf[0][s.cur[0] - 1] = (np.ravel(img))[s.pixel_list]
 
         # Compute the two time correlations between the first level
         # (undownsampled) frames. two_time and img_per_level in place!
@@ -559,9 +552,8 @@ def lazy_two_time(labels, images, num_frames, num_bufs, num_levels=1,
                 s.cur[level] = 1 + s.cur[level] % num_bufs
                 s.count_level[level] = 1 + s.count_level[level]
 
-                s.buf[level, s.cur[level] - 1] = (s.buf[level - 1, prev - 1] +
-                                                  s.buf[level - 1,
-                                                  s.cur[level - 1] - 1])/2
+                s.buf[level][s.cur[level] - 1] = (s.buf[level - 1][prev - 1] +
+                                                  s.buf[level - 1][s.cur[level - 1] - 1])/2
 
                 t1_idx = (s.count_level[level] - 1) * 2
 
@@ -806,13 +798,13 @@ def _validate_and_transform_inputs(num_bufs, num_levels, labels):
     # Ring buffer, a buffer with periodic boundary conditions.
     # Images must be keep for up to maximum delay in buf.
     buf = np.zeros((num_levels, num_bufs, len(pixel_list)),
-                   dtype=np.float64)
+                   dtype=np.float64).tolist()
     # to track how many images processed in each level
     img_per_level = np.zeros(num_levels, dtype=np.int64)
     # to track which levels have already been processed
     track_level = np.zeros(num_levels, dtype=bool)
     # to increment buffer
-    cur = np.ones(num_levels, dtype=np.int64)
+    cur = np.ones(num_levels, dtype=np.int64).tolist()
 
     return (label_array, pixel_list, num_rois, num_pixels,
             lag_steps, buf, img_per_level, track_level, cur,
