@@ -49,6 +49,8 @@ from collections import namedtuple
 import numpy as np
 from scipy.signal import fftconvolve
 
+import cupy
+
 # for a convenient status bar
 try:
     from tqdm import tqdm
@@ -142,15 +144,15 @@ def _one_time_process(
 
         # take out the past_ing and future_img created using bad images
         # (bad images are converted to np.nan array)
-        if np.isnan(past_img).any() or np.isnan(future_img).any():
-            norm[level + 1][ind] += 1
-        else:
-            for w, arr in zip(
-                [past_img * future_img, past_img, future_img],
-                [G, past_intensity_norm, future_intensity_norm],
-            ):
-                binned = np.bincount(label_array, weights=w)[1:]
-                arr[t_index] += (binned / num_pixels - arr[t_index]) / normalize
+        # if np.isnan(past_img).any() or np.isnan(future_img).any():
+        #     norm[level + 1][ind] += 1
+        # else:
+        for w, arr in zip(
+            [past_img * future_img, past_img, future_img],
+            [G, past_intensity_norm, future_intensity_norm],
+        ):
+            binned = np.bincount(label_array, weights=w)[1:]
+            arr[t_index] += (binned / num_pixels - arr[t_index]) / normalize
     return None  # modifies arguments in place!
 
 
@@ -230,7 +232,7 @@ def _init_state_one_time(num_levels, num_bufs, labels):
 
     # G holds the un normalized auto- correlation result. We
     # accumulate computations into G as the algorithm proceeds.
-    G = np.zeros(((num_levels + 1) * num_bufs // 2, num_rois), dtype=np.float64)
+    G = np.zeros_like(labels, shape=((num_levels + 1) * num_bufs // 2, num_rois), dtype=np.float64)
     # matrix for normalizing G into g2
     past_intensity = np.zeros_like(G)
     # matrix for normalizing G into g2
@@ -404,7 +406,7 @@ def lazy_one_time(image_iterable, num_levels, num_bufs, labels, internal_state=N
             g_max = s.past_intensity.shape[0]
 
         g2 = s.G[:g_max] / (s.past_intensity[:g_max] * s.future_intensity[:g_max])
-        yield results(g2, s.lag_steps[:g_max], s)
+        yield results(g2, s.lag_steps[:int(g_max)], s)
 
 
 def multi_tau_auto_corr(num_levels, num_bufs, labels, images):
@@ -871,7 +873,7 @@ def _validate_and_transform_inputs(num_bufs, num_levels, labels):
     label_array, pixel_list = extract_label_indices(labels)
 
     # map the indices onto a sequential list of integers starting at 1
-    label_mapping = {label: n + 1 for n, label in enumerate(np.unique(label_array))}
+    label_mapping = {int(label): n + 1 for n, label in enumerate(np.unique(label_array))}
     # remap the label array to go from 1 -> max(_labels)
     for label, n in label_mapping.items():
         label_array[label_array == label] = n
@@ -887,18 +889,21 @@ def _validate_and_transform_inputs(num_bufs, num_levels, labels):
 
     # these norm and lev_len will help to find the one time correlation
     # normalization norm will updated when there is a bad image
-    norm = {key: [0] * len(dict_lag[key]) for key in (dict_lag.keys())}
+    # intentionally always on CPU
+    norm = {key: np.zeros(len(dict_lag[key]), dtype=np.float64)
+            for key in dict_lag.keys()}
+    # intentionally always on CPU
     lev_len = np.array([len(dict_lag[i]) for i in (dict_lag.keys())])
 
     # Ring buffer, a buffer with periodic boundary conditions.
     # Images must be keep for up to maximum delay in buf.
-    buf = np.zeros((num_levels, num_bufs, len(pixel_list)), dtype=np.float64)
+    buf = np.zeros_like(labels, shape=(num_levels, num_bufs, len(pixel_list)), dtype=np.float64)
     # to track how many images processed in each level
-    img_per_level = np.zeros(num_levels, dtype=np.int64)
+    img_per_level = np.zeros(num_levels, dtype=np.int64)  # intentionally always on CPU
     # to track which levels have already been processed
-    track_level = np.zeros(num_levels, dtype=bool)
+    track_level = np.zeros(num_levels, dtype=bool)  # intentionally always on CPU
     # to increment buffer
-    cur = np.ones(num_levels, dtype=np.int64)
+    cur = np.ones(num_levels, dtype=np.int64)  # intentionally always on CPU
 
     return (
         label_array,

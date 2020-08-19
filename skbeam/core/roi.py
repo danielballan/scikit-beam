@@ -521,7 +521,12 @@ def extract_label_indices(labels):
 
     # TODO Make this tighter.
     w = np.where(np.ravel(labels) > 0)
-    grid = np.indices((img_dim[0], img_dim[1]))
+    # HACK!
+    import cupy
+    if isinstance(labels, cupy.ndarray):
+        grid = cupy.indices((img_dim[0], img_dim[1]))
+    else:
+        grid = np.indices((img_dim[0], img_dim[1]))
     pixel_list = np.ravel((grid[0] * img_dim[1] + grid[1]))[w]
 
     # discard the zeros
